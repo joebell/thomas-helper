@@ -1,0 +1,712 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Batch THOMAS pipeline (Docker-only):
+# 1) Stage input (zip/tar/folder/file)
+# 2) Detect/copy source DICOM
+# 3) Convert DICOM -> NIfTI if needed
+# 4) Run HIPS-THOMAS once (bilateral: left + right)
+# 5) Resample masks back to full image space
+# 6) Build DICOM-SEG
+# 7) Build burned-in bilateral AV/CM/VLP DICOM
+
+usage() {
+  cat <<'EOF' >&2
+Usage:
+  thomas-helper [input_path] [--output-dir DIR] [--workdir DIR] [--threads N] [--keep-containers] [--skip-thomas] [--burn-nuclei CSV|ALL] [--logs-dir DIR] [--log-file FILE] [--no-clean] [--debug]
+
+Outputs under --output-dir:
+  - source_dicom/
+  - dicom_seg/
+  - burned_dicom/
+EOF
+  exit 1
+}
+
+log() {
+  # Write logs to stderr so command substitutions don't capture log lines.
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+}
+
+step() {
+  log "STEP: $*"
+}
+
+on_error() {
+  local exit_code="$1"
+  local line_no="$2"
+  local cmd="$3"
+  log "ERROR: exit=${exit_code} line=${line_no} cmd=${cmd}"
+  log "See detailed log: ${log_file}"
+}
+
+sanitize_slug() {
+  local txt="$1"
+  txt="$(printf '%s' "${txt}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//')"
+  if [[ -z "${txt}" ]]; then
+    txt="input"
+  fi
+  printf '%s' "${txt}"
+}
+
+NUCLEI_CHOICES=(
+  "THALAMUS" "AV" "VA" "VLa" "VLP" "VPL" "VL" "Pul" "LGN" "MGN"
+  "CM" "MD-Pf" "Hb" "MTT" "Acc" "Cau" "Cla" "GPe" "GPi" "Put"
+  "RN" "GP" "Amy" "CL" "VLPd" "VLPv"
+)
+
+choose_input_file() {
+  local base_dir="$1"
+  local -a candidates=()
+  while IFS= read -r p; do
+    candidates+=("${p}")
+  done < <(find "${base_dir}" -maxdepth 3 -type f \( -iname '*.zip' -o -iname '*.tar' -o -iname '*.tar.gz' -o -iname '*.tgz' -o -iname '*.nii' -o -iname '*.nii.gz' \) | sort)
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    echo "ERROR: no input files found in ${base_dir}. Add a zip/tar/NIfTI file or pass [input_path]." >&2
+    exit 1
+  fi
+  if [[ "${#candidates[@]}" -eq 1 ]]; then
+    printf '%s\n' "${candidates[0]}"
+    return
+  fi
+  if [[ ! -t 0 ]]; then
+    echo "ERROR: multiple input files found and no interactive terminal available. Pass [input_path]." >&2
+    printf 'Candidates:\n' >&2
+    printf '  %s\n' "${candidates[@]}" >&2
+    exit 1
+  fi
+  echo "Found multiple input files in ${base_dir}. Select one:" >&2
+  local i=1
+  for p in "${candidates[@]}"; do
+    printf '  %d) %s\n' "${i}" "$(basename "${p}")" >&2
+    i=$((i + 1))
+  done
+  local sel=""
+  while true; do
+    read -r -p "Enter selection [1-${#candidates[@]}]: " sel
+    if [[ "${sel}" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#candidates[@]} )); then
+      printf '%s\n' "${candidates[$((sel - 1))]}"
+      return
+    fi
+    echo "Invalid selection." >&2
+  done
+}
+
+root_dir="$(pwd)"
+input_path=""
+
+output_dir=""
+output_set="0"
+workdir=""
+workdir_set="0"
+threads="4"
+keep_containers="0"
+skip_thomas="0"
+burn_nuclei=""
+logs_dir=""
+log_file=""
+clean_run="1"
+debug="0"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-dir)
+      output_dir="$2"
+      output_set="1"
+      shift 2
+      ;;
+    --workdir)
+      workdir="$2"
+      workdir_set="1"
+      shift 2
+      ;;
+    --threads)
+      threads="$2"
+      shift 2
+      ;;
+    --keep-containers)
+      keep_containers="1"
+      shift 1
+      ;;
+    --skip-thomas)
+      skip_thomas="1"
+      shift 1
+      ;;
+    --burn-nuclei)
+      burn_nuclei="$2"
+      shift 2
+      ;;
+    --logs-dir)
+      logs_dir="$2"
+      shift 2
+      ;;
+    --log-file)
+      log_file="$2"
+      shift 2
+      ;;
+    --no-clean)
+      clean_run="0"
+      shift 1
+      ;;
+    --debug)
+      debug="1"
+      shift 1
+      ;;
+    -*)
+      echo "Unknown arg: $1" >&2
+      usage
+      ;;
+    *)
+      if [[ -z "${input_path}" ]]; then
+        input_path="$1"
+        shift 1
+      else
+        echo "ERROR: unexpected extra positional arg: $1" >&2
+        usage
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "${input_path}" ]]; then
+  input_path="$(choose_input_file "${root_dir}")"
+fi
+
+input_base="$(basename "${input_path}")"
+for ext in ".brainlab.zip" ".tar.gz" ".nii.gz" ".zip" ".tgz" ".tar" ".nii"; do
+  if [[ "${input_base}" == *"${ext}" ]]; then
+    input_base="${input_base%"${ext}"}"
+    break
+  fi
+done
+input_slug="$(sanitize_slug "${input_base}")"
+
+if [[ "${workdir_set}" == "0" ]]; then
+  workdir="run_${input_slug}"
+fi
+if [[ "${output_set}" == "0" ]]; then
+  output_dir="brainlab_export_${input_slug}"
+fi
+
+# Resolve burn-in nuclei selection early so user chooses before long processing starts.
+catalog_csv="$(IFS=,; printf '%s' "${NUCLEI_CHOICES[*]}")"
+selected_burn_nuclei="${burn_nuclei}"
+if [[ -z "${selected_burn_nuclei}" ]]; then
+  if [[ -t 0 ]]; then
+    echo "Select nuclei to burn in (CSV, ALL, or Enter for default)." >&2
+    echo "Available nuclei (HIPS-THOMAS label set): ${catalog_csv}" >&2
+    echo "Default: AV,CM,VLP" >&2
+    read -r -p "burn nuclei> " selected_burn_nuclei
+  fi
+fi
+if [[ -z "${selected_burn_nuclei}" ]]; then
+  selected_burn_nuclei="AV,CM,VLP"
+fi
+if [[ "${selected_burn_nuclei}" == "ALL" ]]; then
+  selected_burn_nuclei="${catalog_csv}"
+fi
+
+selected_burn_nuclei="$(
+  SELECTED="${selected_burn_nuclei}" CATALOG="${catalog_csv}" python3 - <<'PY'
+import os
+import re
+
+def norm(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "", s).upper()
+
+selected = os.environ["SELECTED"]
+catalog_raw = [x for x in os.environ["CATALOG"].split(",") if x]
+catalog_norm = {norm(x): x for x in catalog_raw}
+
+final = []
+seen = set()
+for token in selected.split(","):
+    t = norm(token)
+    if not t:
+        continue
+    if t not in catalog_norm:
+        continue
+    if t in seen:
+        continue
+    seen.add(t)
+    final.append(t)
+print(",".join(final))
+PY
+)"
+if [[ -z "${selected_burn_nuclei}" ]]; then
+  echo "ERROR: no valid burn nuclei selected. Use --burn-nuclei with values from: ${catalog_csv}" >&2
+  exit 1
+fi
+echo "Burn-in nuclei parsed: ${selected_burn_nuclei}" >&2
+
+if [[ "${workdir}" = /* ]]; then
+  workdir_abs="${workdir}"
+else
+  workdir_abs="${root_dir}/${workdir}"
+fi
+if [[ "${output_dir}" = /* ]]; then
+  output_dir_abs="${output_dir}"
+else
+  output_dir_abs="${root_dir}/${output_dir}"
+fi
+
+# Paths mounted into Docker at /data must live under root_dir.
+if [[ "${workdir_abs}" != "${root_dir}"/* ]]; then
+  echo "ERROR: --workdir must be inside ${root_dir} for Docker path mapping." >&2
+  exit 1
+fi
+if [[ "${output_dir_abs}" != "${root_dir}"/* ]]; then
+  echo "ERROR: --output-dir must be inside ${root_dir} for Docker path mapping." >&2
+  exit 1
+fi
+workdir_rel="${workdir_abs#${root_dir}/}"
+output_dir_rel="${output_dir_abs#${root_dir}/}"
+
+dock_plat="--platform=linux/amd64"
+# HIPS-THOMAS Docker image (from thalamicseg/hipsthomasdocker docs).
+thomas_image="anagrammarian/sthomas"
+dcm2niix_image="scitran/dcm2niix"
+dcmqi_image="qiicr/dcmqi"
+plastimatch_image="biocontainers/plastimatch:v1.7.4dfsg.1-2-deb_cv1"
+required_images=("${thomas_image}" "${dcm2niix_image}" "${dcmqi_image}" "${plastimatch_image}")
+
+mkdir -p "${workdir_abs}" "${output_dir_abs}"
+
+staged="${workdir_abs}/staged"
+converted="${workdir_abs}/converted"
+all_out="${workdir_abs}/all_out"
+all_out_r="${workdir_abs}/all_out_R"
+full_lr="${workdir_abs}/all_out_full_lr"
+rt_dicomseg="${workdir_abs}/rt_dicomseg"
+burned_dir="${workdir_abs}/burned"
+
+if [[ "${clean_run}" == "1" ]]; then
+  if [[ "${skip_thomas}" == "1" ]]; then
+    log "ERROR: --skip-thomas cannot be combined with default cleaning. Use --no-clean to reuse prior THOMAS outputs."
+    exit 1
+  fi
+  step "Cleaning previous run state"
+  rm -rf "${workdir_abs}"
+  rm -rf "${output_dir_abs}/dicom_seg" "${output_dir_abs}/burned_dicom" "${output_dir_abs}/source_dicom"
+fi
+
+if [[ -z "${logs_dir}" ]]; then
+  logs_dir="${workdir_abs}/logs"
+fi
+mkdir -p "${staged}" "${converted}" "${all_out}" "${all_out_r}" "${full_lr}" "${rt_dicomseg}" "${burned_dir}" "${logs_dir}"
+if [[ -z "${log_file}" ]]; then
+  log_file="${logs_dir}/run_$(date '+%Y%m%d_%H%M%S').log"
+fi
+
+# Mirror all stdout/stderr to a persistent log file for troubleshooting.
+exec > >(tee -a "${log_file}") 2>&1
+
+if [[ "${debug}" == "1" ]]; then
+  export PS4='+ [${BASH_SOURCE##*/}:${LINENO}] '
+  set -x
+fi
+
+trap 'on_error "$?" "${LINENO}" "${BASH_COMMAND}"' ERR
+
+log "Run started"
+log "input_path=${input_path}"
+log "output_dir=${output_dir_abs}"
+log "workdir=${workdir_abs}"
+log "threads=${threads}"
+log "keep_containers=${keep_containers}"
+log "skip_thomas=${skip_thomas}"
+log "burn_nuclei_arg=${burn_nuclei:-<unset>}"
+log "burn_nuclei_selected=${selected_burn_nuclei}"
+log "clean_run=${clean_run}"
+log "docker_image=${thomas_image}"
+log "logs_dir=${logs_dir}"
+log "log_file=${log_file}"
+
+step "Checking Docker connectivity and required images"
+if ! docker info >/dev/null 2>&1; then
+  log "ERROR: Docker is not reachable. Start Docker Desktop/Colima and retry."
+  exit 1
+fi
+
+missing_images=()
+for img in "${required_images[@]}"; do
+  if ! docker image inspect "${img}" >/dev/null 2>&1; then
+    missing_images+=("${img}")
+  fi
+done
+
+if [[ "${#missing_images[@]}" -gt 0 ]]; then
+  log "Missing Docker images: ${missing_images[*]}"
+  if [[ -t 0 ]]; then
+    pull_ans="n"
+    read -r -p "Pull missing images now? [y/N]: " pull_ans
+    if [[ "${pull_ans}" =~ ^[Yy]$ ]]; then
+      for img in "${missing_images[@]}"; do
+        step "Pulling image ${img}"
+        docker pull "${img}"
+      done
+    else
+      log "ERROR: required images are missing. Cannot continue."
+      exit 1
+    fi
+  else
+    log "ERROR: required images are missing and no interactive terminal is available."
+    log "Run: docker pull ${missing_images[*]}"
+    exit 1
+  fi
+fi
+
+
+# Stage user input into a concrete directory tree.
+stage_input() {
+  local inpath="$1"
+  if [[ -d "${inpath}" ]]; then
+    echo "${inpath}"
+    return
+  fi
+  if [[ "${inpath}" == *.zip ]]; then
+    # unzip on Brainlab exports can return code 1 for path-separator warnings.
+    local uz_code=0
+    set +e
+    unzip -o "${inpath}" -d "${staged}" >/dev/null
+    uz_code=$?
+    set -e
+    if [[ "${uz_code}" -ne 0 ]]; then
+      if [[ "${uz_code}" -eq 1 ]] && [[ -n "$(find "${staged}" -mindepth 1 -print -quit)" ]]; then
+        log "WARN: unzip returned code 1; continuing because files were extracted."
+      else
+        return "${uz_code}"
+      fi
+    fi
+    echo "${staged}"
+    return
+  fi
+  if [[ "${inpath}" == *.tar || "${inpath}" == *.tar.gz || "${inpath}" == *.tgz ]]; then
+    tar -xf "${inpath}" -C "${staged}"
+    echo "${staged}"
+    return
+  fi
+  echo "${inpath}"
+}
+
+step "Staging input payload"
+root="$(stage_input "${input_path}")"
+if [[ ! -e "${root}" ]]; then
+  log "ERROR: staged root does not exist: ${root}"
+  exit 1
+fi
+log "staged_root=${root}"
+
+# Detect the DICOM series directory with the highest file count.
+step "Detecting source DICOM series"
+dicom_dir=""
+if [[ -d "${root}" ]]; then
+  dicom_dir="$(ROOT="${root}" python3 - <<'PY'
+import os
+from pathlib import Path
+
+root = Path(os.environ["ROOT"])
+dicom = []
+for p in root.rglob("*"):
+    if not p.is_file():
+        continue
+    if p.suffix.lower() in {".dcm", ".ima"}:
+        dicom.append(p)
+        continue
+    try:
+        with p.open("rb") as f:
+            h = f.read(132)
+        if len(h) >= 132 and h[128:132] == b"DICM":
+            dicom.append(p)
+    except OSError:
+        pass
+
+if not dicom:
+    print("")
+    raise SystemExit(0)
+
+counts = {}
+for f in dicom:
+    counts[f.parent] = counts.get(f.parent, 0) + 1
+print(sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[0][0])
+PY
+)"
+fi
+log "dicom_dir=${dicom_dir:-<none>}"
+
+if [[ -n "${dicom_dir}" ]]; then
+  step "Copying source DICOM to export/source_dicom"
+  mkdir -p "${output_dir_abs}/source_dicom"
+  cp -R "${dicom_dir}/"* "${output_dir_abs}/source_dicom/"
+  find "${output_dir_abs}/source_dicom" -type f | wc -l | awk '{print "[info] source_dicom_files=" $1}'
+fi
+
+# Pick an existing NIfTI if present; otherwise convert DICOM to NIfTI.
+step "Resolving source NIfTI"
+source_nifti=""
+if [[ -f "${root}" && "${root}" == *.nii* ]]; then
+  source_nifti="${root}"
+else
+  source_nifti="$(ROOT="${root}" python3 - <<'PY'
+import os
+from pathlib import Path
+root = Path(os.environ["ROOT"])
+files = [p for p in root.rglob("*") if p.is_file() and p.name.lower().endswith((".nii", ".nii.gz"))]
+if not files:
+    print("")
+    raise SystemExit(0)
+files.sort(key=lambda p: p.stat().st_size, reverse=True)
+print(files[0])
+PY
+)"
+fi
+
+if [[ -z "${source_nifti}" ]]; then
+  if [[ -z "${dicom_dir}" ]]; then
+    log "ERROR: no DICOM or NIfTI found in input"
+    exit 1
+  fi
+  step "Converting DICOM to NIfTI with dcm2niix"
+  docker run ${dock_plat} --rm --entrypoint dcm2niix \
+    -v "${dicom_dir}:/dicom:ro" -v "${converted}:/out" \
+    "${dcm2niix_image}" -z y -o /out /dicom
+  source_nifti="$(ls -t "${converted}"/*.nii* | head -n 1)"
+fi
+log "source_nifti=${source_nifti}"
+
+source_basename="$(basename "${source_nifti}")"
+cp -f "${source_nifti}" "${workdir_abs}/${source_basename}"
+
+# Detect input contrast type from output metadata (not filename):
+# - T1/MPRAGE/SPGR => run hipsthomas.sh with -t1
+# - FGATIR/WMn     => run default hipsthomas.sh mode
+step "Detecting input contrast from metadata"
+metadata_json=""
+if [[ -f "${source_nifti%.nii.gz}.json" ]]; then
+  metadata_json="${source_nifti%.nii.gz}.json"
+elif [[ -f "${source_nifti%.nii}.json" ]]; then
+  metadata_json="${source_nifti%.nii}.json"
+fi
+
+contrast_type="WMN"
+contrast_reason="No sidecar metadata found; defaulting to WMN mode"
+t1_score="0"
+wmn_score="0"
+source_series_desc="UNKNOWN_SERIES"
+
+if [[ -n "${metadata_json}" && -f "${metadata_json}" ]]; then
+  detection="$(
+    META_JSON="${metadata_json}" python3 - <<'PY'
+import json
+import os
+
+meta_path = os.environ["META_JSON"]
+with open(meta_path, "r", encoding="utf-8", errors="ignore") as f:
+    data = json.load(f)
+
+keys = (
+    "SeriesDescription",
+    "ProtocolName",
+    "ScanningSequence",
+    "SequenceName",
+    "PulseSequenceName",
+    "ImageType",
+)
+
+def to_text(v):
+    if isinstance(v, list):
+        return " ".join(str(x) for x in v)
+    if v is None:
+        return ""
+    return str(v)
+
+parts = []
+for k in keys:
+    txt = to_text(data.get(k, ""))
+    if txt:
+        parts.append((k, txt))
+
+blob = " ".join(t for _, t in parts).upper()
+t1_tokens = ("MPRAGE", "SPGR", "FSPGR", "BRAVO", "T1W", "T1 WEIGHTED", "T1_")
+wmn_tokens = ("FGATIR", "WMN", "WHITE MATTER NUL", "WHITE-MATTER NUL")
+t1_score = sum(blob.count(tok) for tok in t1_tokens)
+wmn_score = sum(blob.count(tok) for tok in wmn_tokens)
+
+label = "WMN"
+if t1_score > wmn_score and t1_score > 0:
+    label = "T1"
+elif wmn_score > t1_score and wmn_score > 0:
+    label = "WMN"
+elif t1_score == 0 and wmn_score == 0:
+    label = "WMN"
+
+evidence = "; ".join(f"{k}={v}" for k, v in parts if v) or "no usable metadata fields"
+series_desc = to_text(data.get("SeriesDescription", "")).strip() or "UNKNOWN_SERIES"
+print(f"{label}|{t1_score}|{wmn_score}|{series_desc}|{evidence}")
+PY
+  )"
+  IFS='|' read -r contrast_type t1_score wmn_score source_series_desc contrast_reason <<< "${detection}"
+fi
+
+thomas_t1_arg=""
+if [[ "${contrast_type}" == "T1" ]]; then
+  thomas_t1_arg="-t1"
+fi
+log "Detected contrast=${contrast_type} (t1_score=${t1_score}, wmn_score=${wmn_score})"
+log "Detected source series description=${source_series_desc}"
+log "Detection evidence: ${contrast_reason}"
+if [[ -n "${thomas_t1_arg}" ]]; then
+  log "THOMAS mode: T1 -> hipsthomas.sh -t1"
+else
+  log "THOMAS mode: WMN/FGATIR -> hipsthomas.sh (default)"
+fi
+
+# Run HIPS-THOMAS once; it produces bilateral results in /data/left and /data/right.
+hips_run_dir="${workdir_abs}/hips_run"
+mkdir -p "${hips_run_dir}"
+cp -f "${workdir_abs}/${source_basename}" "${hips_run_dir}/${source_basename}"
+
+if [[ "${skip_thomas}" == "1" ]]; then
+  step "Skipping HIPS-THOMAS run (--skip-thomas); reusing existing bilateral outputs"
+else
+  step "Running HIPS-THOMAS (single bilateral pass)"
+  if [[ "${keep_containers}" == "1" ]]; then
+    docker rm -f "hipsthomas_bilateral" >/dev/null 2>&1 || true
+    docker run ${dock_plat} --name "hipsthomas_bilateral" \
+      -v "${hips_run_dir}:/data" -w /data "${thomas_image}" \
+      hipsthomas.sh -v -i "${source_basename}" ${thomas_t1_arg} 2>&1 | tee "${logs_dir}/hipsthomas_bilateral.log"
+  else
+    docker run ${dock_plat} --rm \
+      -v "${hips_run_dir}:/data" -w /data "${thomas_image}" \
+      hipsthomas.sh -v -i "${source_basename}" ${thomas_t1_arg} 2>&1 | tee "${logs_dir}/hipsthomas_bilateral.log"
+  fi
+fi
+
+if [[ ! -d "${hips_run_dir}/left" || ! -d "${hips_run_dir}/right" ]]; then
+  log "WARN: canonical bilateral output dirs not found at ${hips_run_dir}/left and ${hips_run_dir}/right; attempting auto-discovery."
+fi
+
+# Resolve bilateral output dirs robustly across image/script variants.
+left_src_dir="${hips_run_dir}/left"
+right_src_dir="${hips_run_dir}/right"
+if [[ ! -f "${left_src_dir}/6-VLP.nii.gz" || ! -f "${right_src_dir}/6-VLP.nii.gz" ]]; then
+  left_src_dir="$(find "${hips_run_dir}" -type d -name left -print | head -n 1 || true)"
+  right_src_dir="$(find "${hips_run_dir}" -type d -name right -print | head -n 1 || true)"
+fi
+if [[ -z "${left_src_dir}" || -z "${right_src_dir}" || ! -d "${left_src_dir}" || ! -d "${right_src_dir}" ]]; then
+  log "ERROR: could not locate bilateral output directories under ${hips_run_dir}"
+  find "${hips_run_dir}" -maxdepth 4 -type d | sed 's/^/[debug] /'
+  exit 1
+fi
+log "left_src_dir=${left_src_dir}"
+log "right_src_dir=${right_src_dir}"
+
+# Normalize bilateral outputs into legacy all_out/all_out_R paths used downstream.
+find "${all_out}" -maxdepth 1 -type f -name '*.nii.gz' -delete
+find "${all_out_r}" -maxdepth 1 -type f -name '*.nii.gz' -delete
+find "${left_src_dir}" -maxdepth 1 -type f -name '*.nii.gz' -exec cp -f {} "${all_out}/" \;
+find "${right_src_dir}" -maxdepth 1 -type f -name '*.nii.gz' -exec cp -f {} "${all_out_r}/" \;
+find "${all_out}" -maxdepth 1 -type f -name '*.nii.gz' | wc -l | awk '{print "[info] all_out_masks=" $1}'
+find "${all_out_r}" -maxdepth 1 -type f -name '*.nii.gz' | wc -l | awk '{print "[info] all_out_R_masks=" $1}'
+
+if [[ ! -f "${all_out}/6-VLP.nii.gz" || ! -f "${all_out_r}/6-VLP.nii.gz" ]]; then
+  log "ERROR: expected bilateral VLP masks were not generated"
+  exit 1
+fi
+
+# Resample L/R masks back into full source image space for export packaging.
+step "Resampling bilateral masks to full image space"
+docker run ${dock_plat} --rm -e "THOMAS_WORKDIR=/repo/${workdir_rel}" -v "${root_dir}:/repo" -w /repo "${thomas_image}" python scripts/resample_lr_in_container.py
+find "${full_lr}" -maxdepth 1 -type f -name '*.nii.gz' | wc -l | awk '{print "[info] full_lr_masks=" $1}'
+
+# Build DICOM-SEG metadata JSON + image references.
+step "Preparing DICOM-SEG metadata"
+WORKDIR_REL="${workdir_rel}" OUTPUT_REL="${output_dir_rel}" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+workdir = Path(os.environ["WORKDIR_REL"])
+output_dir = Path(os.environ["OUTPUT_REL"])
+full_lr = workdir / "all_out_full_lr"
+rt = workdir / "rt_dicomseg"
+rt.mkdir(parents=True, exist_ok=True)
+
+segs = sorted(full_lr.glob("*.nii.gz"))
+entries = []
+for seg in segs:
+    desc = seg.stem.replace("_full", "")
+    entries.append([{
+        "labelID": 1,
+        "SegmentDescription": desc,
+        "SegmentAlgorithmType": "AUTOMATIC",
+        "SegmentAlgorithmName": "HIPS-THOMAS",
+        "SegmentedPropertyCategoryCodeSequence": {"CodeValue": "T-D0050", "CodingSchemeDesignator": "SRT", "CodeMeaning": "Tissue"},
+        "SegmentedPropertyTypeCodeSequence": {"CodeValue": "T-A0100", "CodingSchemeDesignator": "SRT", "CodeMeaning": "Brain"},
+        "AnatomicRegionSequence": {"CodeValue": "T-A0100", "CodingSchemeDesignator": "SRT", "CodeMeaning": "Brain"}
+    }])
+
+(rt / "segment_attributes_all_lr.json").write_text(
+    json.dumps({"segmentAttributes": entries, "seriesDescription": "THOMAS ALL LR SEG"}, indent=2)
+)
+
+src_dicom = output_dir / "source_dicom"
+images = sorted([p for p in src_dicom.iterdir() if p.is_file()])
+(rt / "all_lr_image_list.txt").write_text(
+    "\n".join(f"/data/{output_dir}/source_dicom/{p.name}" for p in images)
+)
+print(f"segs={len(segs)} images={len(images)}")
+PY
+
+# Build DICOM-SEG using dcmqi CLI available in this environment.
+step "Generating bilateral DICOM-SEG"
+mkdir -p "${output_dir_abs}/dicom_seg"
+seg_list="$(
+  find "${full_lr}" -maxdepth 1 -type f -name '*.nii.gz' \
+  | sort \
+  | sed "s#^${root_dir}/#/data/#" \
+  | paste -sd, -
+)"
+docker run ${dock_plat} --rm -v "${root_dir}:/data" "${dcmqi_image}" itkimage2segimage \
+  --inputImageList "${seg_list}" \
+  --inputDICOMDirectory "/data/${output_dir_rel}/source_dicom" \
+  --outputDICOM "/data/${output_dir_rel}/dicom_seg/ALL_lr_seg.dcm" \
+  --inputMetadata "/data/${workdir_rel}/rt_dicomseg/segment_attributes_all_lr.json"
+
+# Build a burned-in bilateral NIfTI for selected nuclei, then convert to DICOM.
+step "Generating burned-in bilateral NIfTI"
+docker run ${dock_plat} --rm \
+  -e "THOMAS_WORKDIR=/repo/${workdir_rel}" \
+  -e "BURN_NUCLEI=${selected_burn_nuclei}" \
+  -v "${root_dir}:/repo" -w /repo "${thomas_image}" python scripts/build_burned_in_container.py
+
+if [[ -n "${dicom_dir}" ]]; then
+  step "Converting burned NIfTI to DICOM series"
+  mkdir -p "${output_dir_abs}/burned_dicom"
+  burned_series_desc="$(SERIES_DESC="${source_series_desc}" python3 - <<'PY'
+import os
+desc = os.environ.get("SERIES_DESC", "").strip()
+if not desc:
+    desc = "UNKNOWN_SERIES"
+burned = f"{desc}-burnedin"
+print(burned[:64])
+PY
+)"
+  log "Burned DICOM SeriesDescription=${burned_series_desc}"
+  docker run ${dock_plat} --rm \
+    -v "${burned_dir}:/nifti" \
+    -v "${output_dir_abs}/source_dicom:/dicom:ro" \
+    -v "${output_dir_abs}/burned_dicom:/out" \
+    "${plastimatch_image}" \
+    plastimatch convert --input /nifti/burned_av_cm_vlp.nii.gz --output-dicom /out --referenced-ct /dicom --series-description "${burned_series_desc}"
+fi
+
+# Final verification summary for quick troubleshooting.
+step "Verifying final outputs"
+find "${output_dir_abs}/source_dicom" -type f | wc -l | awk '{print "[info] source_dicom_files=" $1}'
+find "${output_dir_abs}/burned_dicom" -type f | wc -l | awk '{print "[info] burned_dicom_files=" $1}'
+find "${output_dir_abs}/dicom_seg" -type f | wc -l | awk '{print "[info] dicom_seg_files=" $1}'
+ls -la "${output_dir_abs}/dicom_seg"
+
+log "Done. Output directory: ${output_dir_abs}"
+log "Run log: ${log_file}"

@@ -1,0 +1,11 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+
+# Generated run/output artifacts
+run_*/
+run_thomas_batch*/
+brainlab_export*/
+diagnostics.log
+*.log

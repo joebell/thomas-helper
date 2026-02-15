@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thomas-helper"
+version = "0.1.0"
+description = "Pipeline helper for HIPS-THOMAS thalamic segmentation workflows."
+requires-python = ">=3.10"
+dependencies = [
+  "nibabel>=5.2.0",
+  "numpy>=1.26.0",
+  "pydicom>=2.4.0",
+]
+
+[project.scripts]
+thomas-helper = "thomas_helper.cli:main"
+thomas-helper-batch = "thomas_helper.batch:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
