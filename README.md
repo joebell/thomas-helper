@@ -1,5 +1,8 @@
 # thomas-helper
 
+>[!WARNING]
+>This Software has been designed for research purposes only and has not been reviewed or approved by the Food and Drug Administration or by any other agency. YOU ACKNOWLEDGE AND AGREE THAT CLINICAL APPLICATIONS ARE NEITHER RECOMMENDED NOR ADVISED. Any use of the Software is at the sole risk of the party or parties engaged in such use.
+
 `thomas-helper` is a Docker-based command-line workflow for running HIPS-THOMAS segmentation and packaging results for Brainlab import. It is designed to take common clinical/research inputs (Brainlab zip export, DICOM series, or NIfTI), perform bilateral segmentation, and produce a consistent export package without requiring manual file preparation.
 
 The pipeline performs preflight environment checks, detects image contrast class (T1 versus WMn/FGATIR) from metadata, selects the appropriate THOMAS mode, and generates three deliverables: a copied source DICOM series (`source_dicom/`), bilateral segmentation as DICOM-SEG (`dicom_seg/`), and a burned-in DICOM series (`burned_dicom/`) with user-selected nuclei overlays.
@@ -7,10 +10,6 @@ The pipeline performs preflight environment checks, detects image contrast class
 ## THOMAS
 
 THOMAS (Thalamus Optimized Multi-Atlas Segmentation) is a structural MRI segmentation method for thalamic nuclei. The newer HIPS-THOMAS/sTHOMAS workflow extends THOMAS to support standard T1 images (via WMn-like synthesis) and broader deep grey nuclei outputs. Upstream implementation and release repository: [thalamicseg/sthomas](https://github.com/thalamicseg/sthomas).
-
-### Warning
-
-This Software has been designed for research purposes only and has not been reviewed or approved by the Food and Drug Administration or by any other agency. YOU ACKNOWLEDGE AND AGREE THAT CLINICAL APPLICATIONS ARE NEITHER RECOMMENDED NOR ADVISED. Any use of the Software is at the sole risk of the party or parties engaged in such use.
 
 ## References
 
