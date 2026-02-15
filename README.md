@@ -72,7 +72,8 @@ Required images:
 To run `thomas-helper` from anywhere:
 
 ```bash
-echo 'export PATH="/Users/joe/Code/thomas-helper/scripts:$PATH"' >> ~/.zshrc
+# Run from the repo root
+echo "export PATH=\"$(pwd)/scripts:\$PATH\"" >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -80,6 +81,13 @@ Verify:
 
 ```bash
 which thomas-helper
+```
+
+Alternative (works from any current directory):
+
+```bash
+echo 'export PATH="/absolute/path/to/thomas-helper/scripts:$PATH"' >> ~/.zshrc
+source ~/.zshrc
 ```
 
 ## Usage
