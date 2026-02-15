@@ -1,5 +1,7 @@
 # thomas-helper
 
+Upstream repository reference: [thalamicseg/sthomas](https://github.com/thalamicseg/sthomas). Current workflow/docs: [thalamicseg/hipsthomasdocker](https://github.com/thalamicseg/hipsthomasdocker/tree/main) (container: `anagrammarian/sthomas`).
+
 Docker-first batch pipeline for HIPS-THOMAS segmentation and Brainlab export packaging.
 
 It supports Brainlab zip exports, DICOM folders, and NIfTI input. It produces:
@@ -7,6 +9,23 @@ It supports Brainlab zip exports, DICOM folders, and NIfTI input. It produces:
 - `source_dicom/` (copied source series)
 - `dicom_seg/` (bilateral DICOM-SEG)
 - `burned_dicom/` (source volume with selected nuclei burned in)
+
+## What THOMAS is
+
+THOMAS (Thalamus Optimized Multi-Atlas Segmentation) is a structural MRI segmentation method for thalamic nuclei. The newer HIPS-THOMAS/sTHOMAS workflow extends THOMAS to support standard T1 images (via WMn-like synthesis) and broader deep grey nuclei outputs.
+
+## Academic references and author contributions
+
+1. Su JH, Thomas FT, Kasoff WS, Tourdias T, Choi EY, Rutt BK, Saranathan M. *Thalamus Optimized Multi Atlas Segmentation (THOMAS): fast, fully automated segmentation of thalamic nuclei from structural MRI.* NeuroImage. 2019;194:272-282. DOI: [10.1016/j.neuroimage.2019.03.021](https://doi.org/10.1016/j.neuroimage.2019.03.021).  
+   Contribution context: original THOMAS method and validation for automated thalamic nuclei segmentation from structural MRI.
+
+2. Vidal JP, Danet L, Peran P, Pariente J, Bach Cuadra M, Zahr NM, Barbeau EJ, Saranathan M. *Robust thalamic nuclei segmentation from T1-weighted MRI using polynomial intensity transformation.* Brain Structure and Function. 2024;229(5):1087-1101. PubMed: [38546872](https://pubmed.ncbi.nlm.nih.gov/38546872/).  
+   Contribution context: introduced the HIPS concept that enables robust T1-based thalamic nuclei segmentation by transforming contrast toward WMn-like appearance.
+
+3. Saranathan M, Coligandro G, Hicks T, Patterson D, Vachha B, Hader A, Shazeeb MS, Cacciola A. *Comprehensive Segmentation of Deep Grey Nuclei From Structural MRI Data.* Human Brain Mapping. 2025;46(14). DOI: [10.1002/hbm.70350](https://doi.org/10.1002/hbm.70350).  
+   Contribution context: sTHOMAS expansion to comprehensive deep grey nuclei segmentation.
+
+Software/contributor attribution (from the upstream HIPS-THOMAS/sTHOMAS documentation): design and software engineering contributions from Tom Hicks and Dianne Patterson; algorithm/design contributions from Julie Vidal and Manoj Saranathan; original WMn THOMAS implementation lineage includes Brian Rutt and Jason Su.
 
 ## What the script does
 
@@ -36,6 +55,10 @@ It supports Brainlab zip exports, DICOM folders, and NIfTI input. It produces:
 
 - Docker running locally (Docker Desktop or Colima)
 - Apple Silicon is supported via `--platform=linux/amd64` in the script
+- Platform note from current testing:
+  - On macOS, this workflow was not reliable under Colima in our tests.
+  - On macOS, it ran reliably with Docker Desktop.
+  - Other platforms have not been tested yet.
 
 Required images:
 
