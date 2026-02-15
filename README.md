@@ -2,13 +2,9 @@
 
 Upstream repository reference: [thalamicseg/sthomas](https://github.com/thalamicseg/sthomas). Current workflow/docs: [thalamicseg/hipsthomasdocker](https://github.com/thalamicseg/hipsthomasdocker/tree/main) (container: `anagrammarian/sthomas`).
 
-Docker-first batch pipeline for HIPS-THOMAS segmentation and Brainlab export packaging.
+`thomas-helper` is a Docker-based command-line workflow for running HIPS-THOMAS segmentation and packaging results for Brainlab import. It is designed to take common clinical/research inputs (Brainlab zip export, DICOM series, or NIfTI), perform bilateral segmentation, and produce a consistent export package without requiring manual file preparation.
 
-It supports Brainlab zip exports, DICOM folders, and NIfTI input. It produces:
-
-- `source_dicom/` (copied source series)
-- `dicom_seg/` (bilateral DICOM-SEG)
-- `burned_dicom/` (source volume with selected nuclei burned in)
+The pipeline performs preflight environment checks, detects image contrast class (T1 versus WMn/FGATIR) from metadata, selects the appropriate THOMAS mode, and generates three deliverables: a copied source DICOM series (`source_dicom/`), bilateral segmentation as DICOM-SEG (`dicom_seg/`), and a burned-in DICOM series (`burned_dicom/`) with user-selected nuclei overlays.
 
 ## What THOMAS is
 
@@ -27,29 +23,9 @@ THOMAS (Thalamus Optimized Multi-Atlas Segmentation) is a structural MRI segment
 
 Software/contributor attribution (from the upstream HIPS-THOMAS/sTHOMAS documentation): design and software engineering contributions from Tom Hicks and Dianne Patterson; algorithm/design contributions from Julie Vidal and Manoj Saranathan; original WMn THOMAS implementation lineage includes Brian Rutt and Jason Su.
 
-## What the script does
+## Processing summary
 
-`scripts/thomas-helper` runs this workflow:
-
-1. Preflight checks:
-   - verifies Docker is reachable
-   - verifies required images are present (prompts to pull if missing)
-2. Input selection:
-   - if no input argument is passed, scans the current directory and prompts you to choose a file
-3. Burn-in nuclei selection:
-   - prompts up front (or use `--burn-nuclei`)
-4. Input staging and format detection:
-   - handles zip/tar/folder/NIfTI
-   - detects DICOM series and converts to NIfTI if needed
-5. Contrast detection from metadata:
-   - detects `T1` vs `WMN/FGATIR` from metadata fields (not filename)
-   - uses `hipsthomas.sh -t1` for T1, default mode otherwise
-6. THOMAS segmentation:
-   - runs bilateral HIPS-THOMAS once (or reuses existing results with `--skip-thomas`)
-7. Post-processing:
-   - resamples bilateral masks to source image space
-   - builds DICOM-SEG
-   - builds burned-in DICOM with `SeriesDescription` suffixed by `-burnedin`
+`scripts/thomas-helper` runs a deterministic end-to-end sequence: validate Docker and required images, choose input and burn-in targets, stage and normalize source imaging, run bilateral THOMAS segmentation (or reuse previous segmentation with `--skip-thomas`), resample masks back to source space, generate DICOM-SEG, and create a burned-in DICOM series whose metadata is explicitly renamed with a `-burnedin` suffix for unambiguous identification in Brainlab.
 
 ## Prerequisites
 
