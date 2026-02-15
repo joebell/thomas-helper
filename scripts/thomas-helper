@@ -93,6 +93,7 @@ choose_input_file() {
 }
 
 root_dir="$(pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 input_path=""
 
 output_dir=""
@@ -321,6 +322,7 @@ log "clean_run=${clean_run}"
 log "docker_image=${thomas_image}"
 log "logs_dir=${logs_dir}"
 log "log_file=${log_file}"
+log "script_dir=${script_dir}"
 
 step "Checking Docker connectivity and required images"
 if ! docker info >/dev/null 2>&1; then
@@ -616,7 +618,11 @@ fi
 
 # Resample L/R masks back into full source image space for export packaging.
 step "Resampling bilateral masks to full image space"
-docker run ${dock_plat} --rm -e "THOMAS_WORKDIR=/repo/${workdir_rel}" -v "${root_dir}:/repo" -w /repo "${thomas_image}" python scripts/resample_lr_in_container.py
+docker run ${dock_plat} --rm \
+  -e "THOMAS_WORKDIR=/repo/${workdir_rel}" \
+  -v "${root_dir}:/repo" \
+  -v "${script_dir}:/tool-scripts:ro" \
+  "${thomas_image}" python /tool-scripts/resample_lr_in_container.py
 find "${full_lr}" -maxdepth 1 -type f -name '*.nii.gz' | wc -l | awk '{print "[info] full_lr_masks=" $1}'
 
 # Build DICOM-SEG metadata JSON + image references.
@@ -678,7 +684,9 @@ step "Generating burned-in bilateral NIfTI"
 docker run ${dock_plat} --rm \
   -e "THOMAS_WORKDIR=/repo/${workdir_rel}" \
   -e "BURN_NUCLEI=${selected_burn_nuclei}" \
-  -v "${root_dir}:/repo" -w /repo "${thomas_image}" python scripts/build_burned_in_container.py
+  -v "${root_dir}:/repo" \
+  -v "${script_dir}:/tool-scripts:ro" \
+  "${thomas_image}" python /tool-scripts/build_burned_in_container.py
 
 if [[ -n "${dicom_dir}" ]]; then
   step "Converting burned NIfTI to DICOM series"
